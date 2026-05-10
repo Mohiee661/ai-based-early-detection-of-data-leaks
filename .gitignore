@@ -1,0 +1,31 @@
+# Python
+venv/
+backend/venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.streamlit/
+
+# Environments
+.env
+backend/.env
+frontend/.env.local
+
+# Frontend build artifacts
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+.vercel/
+
+# Backend runtime artifacts
+backend/logs/
+backend/reports/
+backend/models/
+backend/data/
+
+# Local logs
+*.log
+*.err.log
+
+# OS files
+.DS_Store

@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: darkshield-backend
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements-render.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: AUTH_USERNAME
+        sync: false
+      - key: AUTH_DISPLAY_NAME
+        sync: false
+      - key: AUTH_ROLE
+        sync: false
+      - key: AUTH_PASSWORD_HASH
+        sync: false
+      - key: AUTH_JWT_SECRET
+        sync: false
+      - key: AUTH_ACCESS_TOKEN_MINUTES
+        sync: false
