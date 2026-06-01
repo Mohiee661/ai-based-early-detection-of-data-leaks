@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
 import re
 import smtplib
-from datetime import datetime, timezone
+import sys
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
+import math
 
 import httpx
+from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,10 +34,23 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+HMAC_SECRET_KEY = os.environ.get("HMAC_SECRET_KEY", "").strip()
+ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY", "").strip()
+
+# Initialize Fernet cipher (generate key if not provided)
+if not ENCRYPTION_KEY:
+    _cipher_suite = Fernet(Fernet.generate_key())
+    ENCRYPTION_KEY = _cipher_suite.key.decode("utf-8")
+else:
+    try:
+        _cipher_suite = Fernet(ENCRYPTION_KEY.encode("utf-8"))
+    except Exception:
+        _cipher_suite = Fernet(Fernet.generate_key())
+        ENCRYPTION_KEY = _cipher_suite.key.decode("utf-8")
 SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER", "").strip()
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "").strip()
+SMTP_PASSWORD = "".join(os.environ.get("SMTP_PASSWORD", "").split())
 SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "true").strip().lower() in {"1", "true", "yes", "on"}
 SMTP_USE_SSL = os.environ.get("SMTP_USE_SSL", "false").strip().lower() in {"1", "true", "yes", "on"}
 SMTP_TIMEOUT = float(os.environ.get("SMTP_TIMEOUT", "15"))
@@ -47,6 +64,12 @@ ALLOWED_ORIGINS = [origin.strip() for origin in os.environ.get("ALLOWED_ORIGINS"
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+
+def debug_log(*args, **kwargs):
+    """Print with automatic flush for logging"""
+    print(*args, **kwargs, file=sys.stderr, flush=True)
+    sys.stdout.flush()
 
 
 app = FastAPI(title="DarkShield Backend", version="1.0.0")
@@ -121,8 +144,167 @@ def _parse_status(status: str | None) -> str:
     return "pending"
 
 
+def _hmac_sha256_hex(message: str) -> str:
+    if HMAC_SECRET_KEY:
+        return hmac.new(HMAC_SECRET_KEY.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hashlib.sha256(message.encode("utf-8")).hexdigest()
+
+
 def _hash_secret(secret: str) -> str:
-    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+    return _hmac_sha256_hex(secret)
+
+
+def _encrypt_snippet(plaintext: str) -> str:
+    """Encrypt snippet using Fernet (AES-128-CBC + HMAC)."""
+    try:
+        cipher_suite = Fernet(ENCRYPTION_KEY.encode("utf-8"))
+        encrypted = cipher_suite.encrypt(plaintext.encode("utf-8"))
+        return encrypted.decode("utf-8")
+    except Exception:
+        return plaintext
+
+
+def _decrypt_snippet(ciphertext: str) -> str:
+    """Decrypt snippet using Fernet."""
+    if not ciphertext:
+        return ""
+    try:
+        cipher_suite = Fernet(ENCRYPTION_KEY.encode("utf-8"))
+        decrypted = cipher_suite.decrypt(ciphertext.encode("utf-8"))
+        return decrypted.decode("utf-8")
+    except Exception:
+        return ciphertext
+
+
+async def _get_first_commit_date(
+    client: httpx.AsyncClient,
+    owner: str,
+    name: str,
+    file_path: str,
+) -> tuple[datetime | None, int]:
+    """
+    Get the first commit date of a file using GitHub API.
+    Returns (first_commit_date, exposure_days).
+    """
+    try:
+        # Use GitHub API to get commit history for this file.
+        # Page 1 is the newest commit, so follow the last pagination link
+        # when available to reach the oldest commit.
+        url = f"https://api.github.com/repos/{owner}/{name}/commits"
+        headers = {"Accept": "application/vnd.github+json"}
+        if GITHUB_TOKEN:
+            headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+
+        response = await client.get(
+            url,
+            headers=headers,
+            params={"path": file_path, "per_page": 1, "page": 1},
+            timeout=10,
+        )
+        if response.status_code != 200:
+            print(f"WARNING: GitHub API returned {response.status_code} for {owner}/{name}/{file_path}")
+            return None, 0
+
+        history_response = response
+        last_link = response.links.get("last")
+        if last_link and last_link.get("url"):
+            history_response = await client.get(last_link["url"], headers=headers, timeout=10)
+            if history_response.status_code != 200:
+                print(f"WARNING: GitHub API last-page lookup failed for {owner}/{name}/{file_path}")
+                return None, 0
+
+        commits = history_response.json()
+        if not commits or not isinstance(commits, list):
+            print(f"WARNING: No commits found for {file_path}")
+            return None, 0
+
+        oldest_commit = commits[0] if commits else None
+        if not oldest_commit:
+            return None, 0
+
+        commit_meta = oldest_commit.get("commit", {}) if isinstance(oldest_commit, dict) else {}
+        commit_date_str = (
+            commit_meta.get("committer", {}).get("date")
+            or commit_meta.get("author", {}).get("date")
+        )
+        if not commit_date_str:
+            print(f"WARNING: No commit date found for {file_path}")
+            return None, 0
+        
+        # Parse ISO format date
+        first_commit_dt = datetime.fromisoformat(commit_date_str.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        exposure_days = max(0, (now - first_commit_dt).days)
+        
+        print(f"OK: Exposure calculated for {file_path} ({exposure_days} days)")
+        return first_commit_dt, exposure_days
+    except Exception as e:
+        print(f"WARNING: Error calculating exposure for {file_path}: {e}")
+        return None, 0
+
+
+def _calculate_exposure_score(severity: str, exposure_days: int) -> float:
+    """
+    Calculate exposure score using formula: severity_rank × log₂(days + 2).
+    Higher score = longer exposure + higher severity.
+    """
+    severity_map = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
+    severity_rank = severity_map.get(str(severity).upper(), 1)
+    
+    if exposure_days < 0:
+        exposure_days = 0
+    
+    # Log base 2 of (days + 2) to avoid log(0)
+    exposure_multiplier = math.log2(exposure_days + 2)
+
+    return round(severity_rank * exposure_multiplier, 2)
+
+
+async def _hydrate_missing_exposure_fields(
+    client: Client,
+    owner: str,
+    name: str,
+    findings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Backfill exposure fields for findings that predate the scoring migration.
+
+    This keeps the UI populated even when older rows were inserted before
+    exposure tracking existed or when a previous scan could not resolve history.
+    """
+    pending = [
+        finding
+        for finding in findings
+        if finding.get("first_commit_date") is None or finding.get("exposure_days") is None or finding.get("exposure_score") is None
+    ]
+    if not pending:
+        return findings
+
+    async with httpx.AsyncClient(timeout=30) as http_client:
+        for finding in pending:
+            file_path = str(finding.get("file_path") or "").strip()
+            if not file_path:
+                continue
+
+            first_commit_date, exposure_days = await _get_first_commit_date(http_client, owner, name, file_path)
+            if first_commit_date is None:
+                continue
+
+            exposure_score = _calculate_exposure_score(str(finding.get("severity") or "LOW"), exposure_days)
+            patch = {
+                "first_commit_date": first_commit_date.isoformat(),
+                "exposure_days": exposure_days,
+                "exposure_score": exposure_score,
+            }
+
+            finding.update(patch)
+            try:
+                if finding.get("id"):
+                    supabase.table("findings").update(patch).eq("id", finding["id"]).execute()
+            except Exception as exc:
+                print(f"WARNING: Failed to backfill exposure fields for {file_path}: {exc}")
+
+    return findings
 
 
 def _supabase_for_request(request: Request | None) -> Client:
@@ -157,14 +339,108 @@ def _severity_rank(severity: str) -> int:
 
 
 def _mail_alerts_enabled() -> bool:
-    return bool(SMTP_HOST and ALERT_EMAIL_TO)
+    return bool(SMTP_HOST and SMTP_USER and SMTP_PASSWORD and ALERT_EMAIL_TO)
 
 
 def _critical_alert_signature(repo_id: str, critical_findings: list[dict[str, Any]]) -> str:
     digest_source = "|".join(
         [repo_id, *sorted(finding["secret_hash"] for finding in critical_findings if finding.get("secret_hash"))]
     )
-    return hashlib.sha256(digest_source.encode("utf-8")).hexdigest()
+    return _hmac_sha256_hex(digest_source)
+
+
+def _critical_alert_subject(owner: str, name: str, critical_count: int) -> str:
+    return f"[DarkShield] {critical_count} critical finding(s) in {owner}/{name}"
+
+
+def _critical_alert_body(
+    owner: str,
+    name: str,
+    repo_url: str,
+    critical_findings: list[dict[str, Any]],
+    ai_reasoning: str,
+    total_count: int,
+) -> str:
+    lines = [
+        "DarkShield critical alert",
+        "",
+        f"Repository: {owner}/{name}",
+        f"Repository URL: {repo_url}",
+        f"Total findings: {total_count}",
+        f"Critical findings: {len(critical_findings)}",
+        "",
+        "Critical finding details:",
+    ]
+
+    for index, finding in enumerate(critical_findings[:10], start=1):
+        lines.append(
+            f"{index}. {finding['secret_type']} | {finding['file_path']}:{finding['line_number']} | {finding['snippet']}"
+        )
+
+    if len(critical_findings) > 10:
+        lines.append(f"... and {len(critical_findings) - 10} more critical finding(s)")
+
+    if ai_reasoning:
+        lines.extend(["", "AI summary:", ai_reasoning])
+
+    lines.extend(
+        [
+            "",
+            "Immediate response:",
+            "- Rotate exposed secrets",
+            "- Revoke any public or shared credentials",
+            "- Review commit history and remove hardcoded values",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _build_critical_alert_message(
+    owner: str,
+    name: str,
+    repo_url: str,
+    critical_findings: list[dict[str, Any]],
+    ai_reasoning: str,
+    total_count: int,
+) -> EmailMessage:
+    from_address = ALERT_EMAIL_FROM or SMTP_USER or "darkshield@localhost"
+    message = EmailMessage()
+    message["Subject"] = _critical_alert_subject(owner, name, len(critical_findings))
+    message["From"] = from_address
+    message["To"] = ", ".join(ALERT_EMAIL_TO)
+    message.set_content(
+        _critical_alert_body(owner, name, repo_url, critical_findings, ai_reasoning, total_count)
+    )
+    return message
+
+
+def _deliver_email(message: EmailMessage) -> None:
+    try:
+        if SMTP_USE_SSL:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as smtp:
+                if SMTP_USER and SMTP_PASSWORD:
+                    smtp.login(SMTP_USER, SMTP_PASSWORD)
+                smtp.send_message(message)
+            print(f"OK: Email sent successfully to {message['To']}")
+            return
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as smtp:
+            if SMTP_USE_TLS:
+                smtp.starttls()
+            if SMTP_USER and SMTP_PASSWORD:
+                smtp.login(SMTP_USER, SMTP_PASSWORD)
+            smtp.send_message(message)
+        print(f"OK: Email sent successfully to {message['To']}")
+    except smtplib.SMTPAuthenticationError as e:
+        print(f"ERROR: SMTP Authentication Failed: {e}")
+        print("Check SMTP_USER and SMTP_PASSWORD in .env")
+        raise
+    except smtplib.SMTPException as e:
+        print(f"ERROR: SMTP Error: {e}")
+        raise
+    except Exception as e:
+        print(f"ERROR: Email delivery failed: {e}")
+        raise
 
 
 def _critical_alert_already_sent(client: Client, repo_id: str, scan_signature: str) -> bool:
@@ -215,55 +491,32 @@ def _send_critical_mail(
     critical_findings: list[dict[str, Any]],
     ai_reasoning: str,
     total_count: int,
-) -> bool:
-    if not _mail_alerts_enabled() or not critical_findings:
-        return False
+) -> tuple[bool, str | None]:
+    if not _mail_alerts_enabled():
+        debug_log("SKIP: Email alerts disabled (SMTP_HOST, SMTP_USER, SMTP_PASSWORD, or ALERT_EMAIL_TO not set)")
+        return False, "Email alerts are disabled or misconfigured."
+    
+    if not critical_findings:
+        debug_log("SKIP: No critical findings to alert on")
+        return False, "No critical findings to alert on."
 
     scan_signature = _critical_alert_signature(repo_id, critical_findings)
     if _critical_alert_already_sent(client, repo_id, scan_signature):
-        return False
-
-    from_address = ALERT_EMAIL_FROM or SMTP_USER or "darkshield@localhost"
-    subject = f"[DarkShield] Critical findings in {owner}/{name}"
-
-    lines = [
-        f"Repository: {owner}/{name}",
-        f"URL: {repo_url}",
-        f"Critical findings: {len(critical_findings)}",
-        "",
-        "Top critical findings:",
-    ]
-
-    for finding in critical_findings[:10]:
-        lines.append(
-            f"- {finding['secret_type']} | {finding['file_path']}:{finding['line_number']} | {finding['snippet']}"
-        )
-
-    if len(critical_findings) > 10:
-        lines.append(f"- ... and {len(critical_findings) - 10} more")
-
-    if ai_reasoning:
-        lines.extend(["", "AI summary:", ai_reasoning])
-
-    message = EmailMessage()
-    message["Subject"] = subject
-    message["From"] = from_address
-    message["To"] = ", ".join(ALERT_EMAIL_TO)
-    message.set_content("\n".join(lines))
+        debug_log(f"SKIP: Critical alert already sent for {owner}/{name}")
+        return False, "A critical alert for this exact finding set was already sent."
 
     try:
-        if SMTP_USE_SSL:
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as smtp:
-                if SMTP_USER and SMTP_PASSWORD:
-                    smtp.login(SMTP_USER, SMTP_PASSWORD)
-                smtp.send_message(message)
-        else:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as smtp:
-                if SMTP_USE_TLS:
-                    smtp.starttls()
-                if SMTP_USER and SMTP_PASSWORD:
-                    smtp.login(SMTP_USER, SMTP_PASSWORD)
-                smtp.send_message(message)
+        debug_log(f"EMAIL: Preparing critical alert email for {owner}/{name} ({len(critical_findings)} critical findings)")
+        message = _build_critical_alert_message(
+            owner=owner,
+            name=name,
+            repo_url=repo_url,
+            critical_findings=critical_findings,
+            ai_reasoning=ai_reasoning,
+            total_count=total_count,
+        )
+        debug_log(f"EMAIL: Delivering email to: {ALERT_EMAIL_TO}")
+        _deliver_email(message)
         _record_critical_alert(
             client=client,
             repo_id=repo_id,
@@ -273,8 +526,12 @@ def _send_critical_mail(
             recipients=ALERT_EMAIL_TO,
             delivery_status="sent",
         )
-        return True
+        debug_log("OK: Critical alert recorded as sent")
+        return True, None
     except Exception as exc:
+        debug_log(f"ERROR: Critical alert failed: {type(exc).__name__}: {exc}")
+        import traceback
+        debug_log(traceback.format_exc())
         try:
             _record_critical_alert(
                 client=client,
@@ -288,7 +545,7 @@ def _send_critical_mail(
             )
         except Exception:
             pass
-        return False
+        return False, f"{type(exc).__name__}: {exc}"
 
 
 def _build_reasoning(owner: str, name: str, findings: list[dict[str, Any]]) -> str:
@@ -405,6 +662,9 @@ async def _scan_file(
         if response.status_code != 200:
             return
 
+        # Get first commit date for this file (for exposure duration scoring)
+        first_commit_date, exposure_days = await _get_first_commit_date(client, owner, name, file_path)
+
         lines = response.text.splitlines()
         for line_number, line in enumerate(lines, start=1):
             for secret_type, (pattern, severity) in PATTERNS.items():
@@ -413,18 +673,34 @@ async def _scan_file(
                     continue
                 secret_value = match.group(0)
                 secret_hash = _hash_secret(secret_value)
-                findings.append(
-                    {
-                        "repo_id": repo_id,
-                        "file_path": file_path,
-                        "line_number": line_number,
-                        "secret_type": secret_type,
-                        "severity": severity,
-                        "snippet": line.strip()[:120],
-                        "secret_hash": secret_hash,
-                    }
-                )
-    except Exception:
+                
+                # Encrypt the snippet
+                plain_snippet = line.strip()[:120]
+                encrypted_snippet = _encrypt_snippet(plain_snippet)
+                
+                # Calculate exposure score (default to 0 if no first_commit_date)
+                exposure_score = _calculate_exposure_score(severity, exposure_days) if first_commit_date else None
+                
+                finding = {
+                    "repo_id": repo_id,
+                    "file_path": file_path,
+                    "line_number": line_number,
+                    "secret_type": secret_type,
+                    "severity": severity,
+                    "snippet": plain_snippet,
+                    "snippet_enc": encrypted_snippet,
+                    "secret_hash": secret_hash,
+                }
+                
+                # Add exposure data if available
+                if first_commit_date:
+                    finding["first_commit_date"] = first_commit_date.isoformat()
+                    finding["exposure_days"] = exposure_days
+                    finding["exposure_score"] = exposure_score
+                
+                findings.append(finding)
+    except Exception as e:
+        print(f"WARNING: Error scanning {file_path}: {e}")
         return
 
 
@@ -435,12 +711,14 @@ async def health() -> dict[str, str]:
 
 @app.post("/scan")
 async def scan_repo(req: ScanRequest, request: Request) -> dict[str, Any]:
+    print(f"\nSCAN: Starting scan for repo ID: {req.repo_id}")
     client = _supabase_for_request(request)
     repo = _safe_repo_lookup(client, req.repo_id)
     owner = str(repo.get("owner") or "").strip()
     name = str(repo.get("name") or "").strip()
     github_url = str(repo.get("github_url") or "").strip()
 
+    print(f"SCAN: {owner}/{name}")
     client.table("repos").update({"status": "scanning"}).eq("id", req.repo_id).execute()
 
     headers: dict[str, str] = {"Accept": "application/vnd.github+json"}
@@ -455,6 +733,7 @@ async def scan_repo(req: ScanRequest, request: Request) -> dict[str, Any]:
                 f"https://api.github.com/repos/{owner}/{name}/git/trees/HEAD?recursive=1"
             )
             if tree_resp.status_code != 200:
+                print(f"ERROR: Failed to fetch repo tree: {tree_resp.status_code}")
                 client.table("repos").update({"status": "error"}).eq("id", req.repo_id).execute()
                 raise HTTPException(status_code=400, detail="Could not fetch repo. Is it public?")
 
@@ -465,6 +744,7 @@ async def scan_repo(req: ScanRequest, request: Request) -> dict[str, Any]:
                 if item.get("type") == "blob" and not _should_skip_file(str(item.get("path") or ""), item.get("size"))
             ]
 
+            print(f"SCAN: Scanning {len(files)} files...")
             for file_item in files[:200]:
                 await _scan_file(
                     client=http_client,
@@ -477,6 +757,7 @@ async def scan_repo(req: ScanRequest, request: Request) -> dict[str, Any]:
     except HTTPException:
         raise
     except Exception as exc:
+        print(f"ERROR: Scan failed: {exc}")
         client.table("repos").update({"status": "error"}).eq("id", req.repo_id).execute()
         raise HTTPException(status_code=500, detail=f"Repository scan failed: {type(exc).__name__}: {exc}") from exc
 
@@ -489,23 +770,30 @@ async def scan_repo(req: ScanRequest, request: Request) -> dict[str, Any]:
         seen.add(key)
         unique_findings.append(finding)
 
+    print(f"OK: Found {len(unique_findings)} unique secrets")
+
     for finding in unique_findings:
         finding["cluster_id"] = None
 
     if unique_findings:
+        print("DB: Saving findings to database...")
         client.table("findings").upsert(
             unique_findings,
             on_conflict="repo_id,file_path,line_number,secret_hash",
         ).execute()
+        print("OK: Findings saved")
 
     findings_for_reasoning: list[dict[str, Any]] = []
     for finding in unique_findings:
         finding["cluster_repo_count"] = _distinct_repo_count_for_hash(client, finding["secret_hash"])
         findings_for_reasoning.append(finding)
 
+    print("AI: Generating AI reasoning...")
     ai_reasoning = _build_reasoning(owner, name, findings_for_reasoning)
     critical_findings = [finding for finding in unique_findings if str(finding.get("severity") or "").upper() == "CRITICAL"]
-    mail_sent = _send_critical_mail(
+    print(f"ALERT: Critical findings: {len(critical_findings)}")
+    
+    mail_sent, mail_error = _send_critical_mail(
         client,
         req.repo_id,
         owner,
@@ -525,6 +813,8 @@ async def scan_repo(req: ScanRequest, request: Request) -> dict[str, Any]:
         }
     ).eq("id", req.repo_id).execute()
 
+    print(f"OK: Scan complete for {owner}/{name}")
+
     return {
         "repo_id": req.repo_id,
         "github_url": github_url,
@@ -532,13 +822,29 @@ async def scan_repo(req: ScanRequest, request: Request) -> dict[str, Any]:
         "ai_reasoning": ai_reasoning,
         "critical_alerts_enabled": _mail_alerts_enabled(),
         "critical_alert_email_sent": mail_sent,
+        "critical_alert_error": mail_error,
         "critical_findings": len(critical_findings),
+    }
+
+
+@app.delete("/repos/{repo_id}")
+async def delete_repo(repo_id: str, request: Request) -> dict[str, Any]:
+    client = _supabase_for_request(request)
+    repo = _safe_repo_lookup(client, repo_id)
+    client.table("repos").delete().eq("id", repo_id).execute()
+    return {
+        "deleted": True,
+        "repo_id": repo_id,
+        "github_url": repo.get("github_url"),
+        "owner": repo.get("owner"),
+        "name": repo.get("name"),
     }
 
 
 @app.get("/findings/{repo_id}")
 async def get_findings(repo_id: str, request: Request) -> list[dict[str, Any]]:
     client = _supabase_for_request(request)
+    repo = _safe_repo_lookup(client, repo_id)
     response = (
         client.table("findings")
         .select("*")
@@ -546,7 +852,23 @@ async def get_findings(repo_id: str, request: Request) -> list[dict[str, Any]]:
         .order("created_at", desc=True)
         .execute()
     )
-    return getattr(response, "data", []) or []
+    findings = getattr(response, "data", []) or []
+    
+    # Decrypt snippets on retrieval
+    for finding in findings:
+        if finding.get("snippet_enc"):
+            finding["snippet"] = _decrypt_snippet(finding["snippet_enc"])
+        # Include exposure duration and score in response for older rows too.
+        if finding.get("exposure_days") is None and finding.get("first_commit_date"):
+            first_commit = datetime.fromisoformat(finding["first_commit_date"].replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            exposure_days = max(0, (now - first_commit).days)
+            finding["exposure_days"] = exposure_days
+            finding["exposure_score"] = _calculate_exposure_score(finding.get("severity", "LOW"), exposure_days)
+
+    findings = await _hydrate_missing_exposure_fields(client, str(repo.get("owner") or ""), str(repo.get("name") or ""), findings)
+
+    return findings
 
 
 @app.get("/clusters")
