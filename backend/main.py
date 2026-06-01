@@ -60,7 +60,14 @@ ALERT_EMAIL_TO = [
     for recipient in os.environ.get("ALERT_EMAIL_TO", "").split(",")
     if recipient.strip()
 ]
-ALLOWED_ORIGINS = [origin.strip() for origin in os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000").split(",") if origin.strip()]
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get(
+        "ALLOWED_ORIGINS",
+        "http://localhost:3000,http://127.0.0.1:3000",
+    ).split(",")
+    if origin.strip()
+]
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
@@ -804,14 +811,17 @@ async def scan_repo(req: ScanRequest, request: Request) -> dict[str, Any]:
         len(unique_findings),
     )
 
-    client.table("repos").update(
-        {
-            "status": "done",
-            "last_scanned_at": _now_iso(),
-            "finding_count": len(unique_findings),
-            "ai_reasoning": ai_reasoning,
-        }
-    ).eq("id", req.repo_id).execute()
+    try:
+        client.table("repos").update(
+            {
+                "status": "done",
+                "last_scanned_at": _now_iso(),
+                "finding_count": len(unique_findings),
+                "ai_reasoning": ai_reasoning,
+            }
+        ).eq("id", req.repo_id).execute()
+    except Exception as exc:
+        print(f"WARNING: Failed to finalize repo scan status: {exc}")
 
     print(f"OK: Scan complete for {owner}/{name}")
 

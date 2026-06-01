@@ -1,148 +1,101 @@
-# DarkShield Explanation
+# DarkShield Features
 
-DarkShield monitors GitHub repositories for exposed secrets, stores the findings in Supabase, and surfaces cross-repo reuse so the most dangerous leaks are easy to prioritize.
+DarkShield scans GitHub repositories for exposed secrets, stores findings in Supabase, and helps you prioritize the riskiest leaks.
 
-## What the app does
+## Authentication
 
-1. A user signs in with Supabase Auth.
-2. The user adds one or more GitHub repository URLs.
-3. The backend scans each repository for secret patterns.
-4. Findings are stored in Supabase and shown in the frontend.
-5. Groq generates a short analyst summary for the scan.
-6. Cross-repo clustering groups identical secrets across repositories.
-7. Critical findings trigger email alerts when SMTP is configured.
+- Users sign in with Supabase Auth on `/login`.
+- The frontend uses the logged-in session to scope repository data to the current user.
 
-## Main pages
+## Repository monitoring
 
-- `/login`
-  - Email and password login via Supabase Auth.
-- `/`
-  - List of monitored repositories.
-  - Add Repo flow.
-  - Scan Now actions.
-- `/repos/[id]`
-  - Full report for one repository.
-  - AI reasoning card.
-  - Exposure time and exposure score columns.
-  - Cross-repo cluster warning banner.
-- `/clusters`
-  - Secrets found in more than one repository.
+- The `/` page lists every repository the user added.
+- Adding a repository stores its owner, name, and GitHub URL in Supabase.
+- The backend scans the repository after it is added or when the user clicks `Scan Now`.
 
-## Backend features
+## Secret scanning
 
-### Secret scanning
+- The backend fetches the repository file tree from GitHub.
+- It skips large or irrelevant binary-like files.
+- Each file is scanned line by line with regex patterns for common secret formats.
+- Matched values are hashed so the same secret can be recognized across repositories.
 
-The backend scans raw file contents from GitHub and matches secrets with regex patterns such as:
+## Severity levels
 
-- AWS access keys
-- AWS secret keys
-- OpenAI keys
-- Anthropic keys
-- Groq keys
-- GitHub tokens
-- Stripe secrets
-- Google API keys
-- Slack tokens
-- private keys
-- generic password-like assignments
-- generic secret-like assignments
+- Each regex pattern has a severity level assigned in the backend.
+- Examples:
+  - AWS secret keys and private keys are marked `critical`
+  - OpenAI, Anthropic, Groq, GitHub, and Stripe-style tokens are usually `high`
+  - generic password or secret patterns are usually `medium`
+- The severity comes from the secret type that matched, not from machine learning.
+- That severity is used in the UI and also in the exposure score calculation.
 
-### Secret hashing and clustering
+## Finding storage
 
-Every detected secret value is hashed with SHA256 or HMAC-SHA256, depending on configuration. Identical hashes are treated as the same secret across repositories.
+- Every match becomes a `findings` row in Supabase.
+- Each finding stores:
+  - file path
+  - line number
+  - secret type
+  - severity
+  - snippet
+  - secret hash
+  - cluster link
+  - exposure metadata when available
 
-That hash is used to:
+## Exposure time and exposure score
 
-- link findings to clusters
-- count how many repos share the same secret
-- prevent duplicate alert spam for the same exposure set
+- The backend tries to find the first commit date for the file through the GitHub commits API.
+- `exposure_days` is the number of days since that first commit.
+- `exposure_score` is calculated as severity weight multiplied by `log2(exposure_days + 2)`.
+- The repo detail page shows both values in the findings table.
+- If older rows do not already have these fields, the API backfills them when possible.
 
-### Exposure time and exposure score
+## Groq reasoning
 
-For each finding, the backend attempts to look up the first commit date of the file through the GitHub commits API.
+- After a scan, the backend sends a short summary to Groq when `GROQ_API_KEY` is configured.
+- Groq returns a plain-English security summary.
+- The repo detail page shows that reasoning in the AI analysis card.
 
-- `exposure_days` = days since first commit
-- `exposure_score` = severity weight multiplied by `log2(exposure_days + 2)`
+## Cross-repo clustering
 
-If the values already exist in the database, the API returns them directly.
-If older rows are missing those fields, the read path backfills them when possible.
+- Identical secret hashes are grouped into clusters.
+- A cluster is considered interesting when the same secret appears in more than one repository.
+- The `/clusters` page shows those shared secrets and how many repos are affected.
 
-### Groq reasoning
+## Email alerts
 
-If `GROQ_API_KEY` is present, the backend sends the scan summary to Groq and stores the generated reasoning on the repo row.
+- If SMTP settings are configured, the backend emails critical findings.
+- The email includes the repo name, repo URL, critical findings, and the AI summary.
+- Sent alerts are recorded in `critical_alert_notifications` so the same alert set is not sent twice.
 
-The stored reasoning is displayed on the repo detail page.
+## Repo detail page
 
-### Email alerts
+The `/repos/[id]` page combines all of the above:
 
-If SMTP settings are configured, critical findings trigger an email alert.
+- repository status
+- Groq reasoning
+- total secrets
+- critical count
+- cross-repo cluster count
+- findings table
+- exposure time
+- exposure score
+- cluster warning banner
 
-The email contains:
+## What the backend depends on
 
-- repository name
-- repository URL
-- total findings
-- critical findings
-- top critical finding details
-- AI summary
-- immediate response guidance
+- Supabase for auth and storage
+- GitHub API for repository contents and commit history
+- Groq for reasoning summaries
+- SMTP for alert emails
 
-The backend also records notification history in `critical_alert_notifications` so the same critical set is not sent repeatedly.
+## How the pieces work together
 
-## Frontend behavior
-
-The frontend uses Supabase browser auth helpers for session management. It:
-
-- redirects unauthenticated users to `/login`
-- fetches repository rows from Supabase
-- calls the FastAPI backend to scan repositories
-- fetches findings and clusters for display
-- shows severity badges, exposure age, and exposure score
-
-## Database tables
-
-- `repos`
-  - monitored GitHub repositories
-  - status, scan time, finding count, AI reasoning
-- `findings`
-  - one row per detected secret instance
-  - file path, line number, severity, snippet, hash, exposure data
-- `clusters`
-  - one row per shared secret hash
-  - repo count and severity
-- `critical_alert_notifications`
-  - alert history and dedupe state for email notifications
-
-## Runtime configuration
-
-Backend environment variables:
-
-- `SUPABASE_URL`
-- `SUPABASE_KEY`
-- `GROQ_API_KEY`
-- `GITHUB_TOKEN`
-- `HMAC_SECRET_KEY`
-- `ENCRYPTION_KEY`
-- `SMTP_HOST`
-- `SMTP_PORT`
-- `SMTP_USER`
-- `SMTP_PASSWORD`
-- `SMTP_USE_TLS`
-- `SMTP_USE_SSL`
-- `ALERT_EMAIL_FROM`
-- `ALERT_EMAIL_TO`
-- `ALLOWED_ORIGINS`
-
-Frontend environment variables:
-
-- `NEXT_PUBLIC_SUPABASE_URL`
-- `NEXT_PUBLIC_SUPABASE_ANON_KEY`
-- `NEXT_PUBLIC_API_URL`
-
-## Operational notes
-
-- Public GitHub repos are the intended scanning target.
-- GitHub rate limits can affect exposure lookup if `GITHUB_TOKEN` is missing.
-- SMTP passwords copied with spaces can break Gmail authentication, so the backend now normalizes the password at runtime.
-- The repo detail page shows exposure columns only when the backend returns exposure data.
-
+1. A user adds a GitHub repository.
+2. The backend scans the repo and extracts secrets.
+3. Findings are stored in Supabase.
+4. Exposure age and score are calculated when commit history is available.
+5. Groq generates a short summary.
+6. Shared secret hashes are grouped into clusters.
+7. Critical findings trigger an email alert if SMTP is valid.

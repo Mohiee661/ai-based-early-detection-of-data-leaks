@@ -11,6 +11,7 @@ import {
   ScanSearch,
   ShieldAlert,
   Sparkles,
+  Trash2,
 } from "lucide-react";
 
 import { AppNavbar } from "@/components/app-navbar";
@@ -40,6 +41,9 @@ type FindingRow = {
   secret_hash: string;
   cluster_id: string | null;
   created_at: string;
+  exposure_days?: number;
+  exposure_score?: number;
+  first_commit_date?: string;
 };
 
 type ClusterRow = {
@@ -52,6 +56,29 @@ type ClusterRow = {
 };
 
 const FILTERS = ["All", "Critical", "High", "Medium"] as const;
+
+function formatExposureDuration(days: number | undefined): string {
+  if (!days && days !== 0) return "Unknown";
+  if (days === 0) return "< 1 day";
+  if (days === 1) return "1 day";
+  if (days < 7) return `${days} days`;
+  if (days < 30) return `${Math.floor(days / 7)} weeks`;
+  if (days < 365) return `${Math.floor(days / 30)} months`;
+  return `${Math.floor(days / 365)} years`;
+}
+
+function formatExposureScore(score: number | undefined): string {
+  if (!score && score !== 0) return "N/A";
+  return score.toFixed(1);
+}
+
+function exposureScoreTone(score: number | undefined): string {
+  if (!score && score !== 0) return "text-slate-400";
+  if (score >= 12) return "text-red-300";
+  if (score >= 8) return "text-orange-300";
+  if (score >= 4) return "text-yellow-300";
+  return "text-green-300";
+}
 
 function severityTone(severity: string) {
   switch (severity.toUpperCase()) {
@@ -80,6 +107,7 @@ export default function RepoDetailPage() {
 
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [repo, setRepo] = useState<RepoRow | null>(null);
   const [findings, setFindings] = useState<FindingRow[]>([]);
@@ -123,11 +151,25 @@ export default function RepoDetailPage() {
         ? { Authorization: `Bearer ${data.session.access_token}` }
         : undefined;
 
-      const [{ data: repoData, error: repoError }, findingsResponse, clustersResponse] = await Promise.all([
-        supabase.from("repos").select("*").eq("id", repoId).single(),
-        fetch(`${apiUrl}/findings/${repoId}`, { headers: authHeaders }),
-        fetch(`${apiUrl}/clusters`, { headers: authHeaders }),
-      ]);
+      let repoData;
+      let repoError;
+      let findingsResponse: Response;
+      let clustersResponse: Response;
+
+      try {
+        [{ data: repoData, error: repoError }, findingsResponse, clustersResponse] = await Promise.all([
+          supabase.from("repos").select("*").eq("id", repoId).single(),
+          fetch(`${apiUrl}/findings/${repoId}`, { headers: authHeaders }),
+          fetch(`${apiUrl}/clusters`, { headers: authHeaders }),
+        ]);
+      } catch (fetchError) {
+        if (!active) {
+          return;
+        }
+        setError(fetchError instanceof Error ? fetchError.message : "Failed to fetch repository data.");
+        setLoading(false);
+        return;
+      }
 
       if (!active) {
         return;
@@ -183,7 +225,7 @@ export default function RepoDetailPage() {
 
     setBusy(true);
     try {
-      await fetch(`${apiUrl}/scan`, {
+      const scanResponse = await fetch(`${apiUrl}/scan`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -191,6 +233,11 @@ export default function RepoDetailPage() {
         },
         body: JSON.stringify({ repo_id: repo.id }),
       });
+
+      if (!scanResponse.ok) {
+        const payload = (await scanResponse.json().catch(() => null)) as { detail?: string; critical_alert_error?: string } | null;
+        throw new Error(payload?.detail || payload?.critical_alert_error || "Failed to start scan.");
+      }
 
       const supabase = getSupabaseClient();
       if (!supabase) {
@@ -216,16 +263,54 @@ export default function RepoDetailPage() {
       if (clustersResponse.ok) {
         setClusters((await clustersResponse.json()) as ClusterRow[]);
       }
+    } catch (scanError) {
+      setError(scanError instanceof Error ? scanError.message : "Failed to scan repository.");
     } finally {
       setBusy(false);
     }
   }
 
+  async function handleDeleteRepo() {
+    if (!repo) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Delete ${repo.owner}/${repo.name}? This will remove the repo, findings, alerts, and notification history from your view.`,
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setDeleteBusy(true);
+    try {
+      const response = await fetch(`${apiUrl}/repos/${repo.id}`, {
+        method: "DELETE",
+        headers: {
+          "Content-Type": "application/json",
+          ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+        },
+      });
+
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as { detail?: string } | null;
+        throw new Error(payload?.detail || "Failed to delete repository.");
+      }
+
+      router.replace("/");
+      router.refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to delete repository.");
+    } finally {
+      setDeleteBusy(false);
+    }
+  }
+
   if (loading) {
     return (
-      <main className="min-h-screen bg-slate-950 text-slate-50">
+      <main className="min-h-screen bg-background text-foreground">
         <div className="flex min-h-screen items-center justify-center">
-          <div className="flex items-center gap-3 text-slate-300">
+          <div className="flex items-center gap-3 text-muted-foreground">
             <LoaderCircle className="size-5 animate-spin" />
             Loading repo...
           </div>
@@ -235,13 +320,13 @@ export default function RepoDetailPage() {
   }
 
   return (
-    <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(20,34,66,0.75),_rgba(5,10,18,1)_55%)] text-slate-50">
+    <main className="min-h-screen bg-background text-foreground">
       <AppNavbar />
 
       <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 px-4 py-8 sm:px-6 lg:px-8">
-        <section className="flex flex-col gap-4 rounded-3xl border border-white/10 bg-white/5 p-6 shadow-2xl shadow-black/15 backdrop-blur lg:flex-row lg:items-start lg:justify-between">
+        <section className="surface-card flex flex-col gap-4 p-6 shadow-[0_18px_60px_rgba(0,0,0,0.08)] lg:flex-row lg:items-start lg:justify-between">
           <div className="space-y-3">
-            <Link href="/" className="inline-flex items-center gap-2 text-sm text-slate-300 transition hover:text-white">
+            <Link href="/" className="inline-flex items-center gap-2 text-sm text-muted-foreground transition hover:text-foreground">
               <ArrowLeft className="size-4" />
               Back to repos
             </Link>
@@ -254,27 +339,39 @@ export default function RepoDetailPage() {
                 href={repo?.github_url || "#"}
                 target="_blank"
                 rel="noreferrer"
-                className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs font-medium text-slate-200 transition hover:bg-white/10"
+                className="inline-flex items-center gap-2 rounded-full border border-border bg-background px-3 py-1 text-xs font-medium text-foreground transition hover:bg-muted"
               >
                 GitHub
                 <ExternalLink className="size-3.5" />
               </a>
             </div>
 
-            <p className="max-w-3xl text-sm leading-6 text-slate-300">
-              Repository monitoring status: <span className="font-semibold text-slate-100">{repo?.status}</span>
+            <p className="max-w-3xl text-sm leading-6 text-muted-foreground">
+              Repository monitoring status: <span className="font-semibold text-foreground">{repo?.status}</span>
             </p>
           </div>
 
-          <button
-            type="button"
-            onClick={handleScanNow}
-            disabled={busy}
-            className="inline-flex items-center gap-2 rounded-2xl bg-cyan-400 px-5 py-3 text-sm font-semibold text-slate-950 transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-70"
-          >
-            {busy ? <LoaderCircle className="size-4 animate-spin" /> : <ScanSearch className="size-4" />}
-            Scan Now
-          </button>
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              onClick={handleDeleteRepo}
+              disabled={deleteBusy}
+              className="inline-flex items-center gap-2 rounded-2xl border border-destructive/20 bg-destructive/10 px-5 py-3 text-sm font-semibold text-destructive transition hover:bg-destructive/20 disabled:cursor-not-allowed disabled:opacity-70"
+            >
+              {deleteBusy ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+              Delete Repo
+            </button>
+
+            <button
+              type="button"
+              onClick={handleScanNow}
+              disabled={busy}
+              className="inline-flex items-center gap-2 rounded-2xl bg-primary px-5 py-3 text-sm font-semibold text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-70"
+            >
+              {busy ? <LoaderCircle className="size-4 animate-spin" /> : <ScanSearch className="size-4" />}
+              Scan Now
+            </button>
+          </div>
         </section>
 
         {repo?.ai_reasoning ? (
@@ -341,6 +438,8 @@ export default function RepoDetailPage() {
                   <th className="px-5 py-4 font-medium">File</th>
                   <th className="px-5 py-4 font-medium">Line</th>
                   <th className="px-5 py-4 font-medium">Snippet</th>
+                  <th className="px-5 py-4 font-medium">Exposure Time</th>
+                  <th className="px-5 py-4 font-medium">Exposure Score</th>
                 </tr>
               </thead>
               <tbody>
@@ -364,11 +463,17 @@ export default function RepoDetailPage() {
                           {finding.snippet}
                         </code>
                       </td>
+                      <td className="px-5 py-4 align-top text-xs text-slate-300" title={finding.first_commit_date}>
+                        {formatExposureDuration(finding.exposure_days)}
+                      </td>
+                      <td className={`px-5 py-4 align-top text-xs font-semibold ${exposureScoreTone(finding.exposure_score)}`}>
+                        {formatExposureScore(finding.exposure_score)}
+                      </td>
                     </tr>
                   ))
                 ) : (
                   <tr>
-                    <td colSpan={5} className="px-5 py-10 text-center text-sm text-slate-400">
+                    <td colSpan={7} className="px-5 py-10 text-center text-sm text-slate-400">
                       No findings match the current filter.
                     </td>
                   </tr>
