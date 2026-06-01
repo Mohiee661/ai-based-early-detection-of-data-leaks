@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import smtplib
 from datetime import datetime, timezone
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +30,19 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "").strip()
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "").strip()
+SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "true").strip().lower() in {"1", "true", "yes", "on"}
+SMTP_USE_SSL = os.environ.get("SMTP_USE_SSL", "false").strip().lower() in {"1", "true", "yes", "on"}
+SMTP_TIMEOUT = float(os.environ.get("SMTP_TIMEOUT", "15"))
+ALERT_EMAIL_FROM = os.environ.get("ALERT_EMAIL_FROM", "").strip()
+ALERT_EMAIL_TO = [
+    recipient.strip()
+    for recipient in os.environ.get("ALERT_EMAIL_TO", "").split(",")
+    if recipient.strip()
+]
 ALLOWED_ORIGINS = [origin.strip() for origin in os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000").split(",") if origin.strip()]
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -139,6 +154,141 @@ def _should_skip_file(path: str, size: int | None) -> bool:
 def _severity_rank(severity: str) -> int:
     mapping = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
     return mapping.get(severity.upper(), 1)
+
+
+def _mail_alerts_enabled() -> bool:
+    return bool(SMTP_HOST and ALERT_EMAIL_TO)
+
+
+def _critical_alert_signature(repo_id: str, critical_findings: list[dict[str, Any]]) -> str:
+    digest_source = "|".join(
+        [repo_id, *sorted(finding["secret_hash"] for finding in critical_findings if finding.get("secret_hash"))]
+    )
+    return hashlib.sha256(digest_source.encode("utf-8")).hexdigest()
+
+
+def _critical_alert_already_sent(client: Client, repo_id: str, scan_signature: str) -> bool:
+    response = (
+        client.table("critical_alert_notifications")
+        .select("id")
+        .eq("repo_id", repo_id)
+        .eq("scan_signature", scan_signature)
+        .eq("delivery_status", "sent")
+        .limit(1)
+        .execute()
+    )
+    rows = getattr(response, "data", []) or []
+    return bool(rows)
+
+
+def _record_critical_alert(
+    client: Client,
+    repo_id: str,
+    scan_signature: str,
+    critical_count: int,
+    total_count: int,
+    recipients: list[str],
+    delivery_status: str,
+    error_message: str | None = None,
+) -> None:
+    payload = {
+        "repo_id": repo_id,
+        "scan_signature": scan_signature,
+        "critical_count": critical_count,
+        "total_count": total_count,
+        "recipients": recipients,
+        "delivery_status": delivery_status,
+        "error_message": error_message,
+    }
+    client.table("critical_alert_notifications").upsert(
+        payload,
+        on_conflict="repo_id,scan_signature",
+    ).execute()
+
+
+def _send_critical_mail(
+    client: Client,
+    repo_id: str,
+    owner: str,
+    name: str,
+    repo_url: str,
+    critical_findings: list[dict[str, Any]],
+    ai_reasoning: str,
+    total_count: int,
+) -> bool:
+    if not _mail_alerts_enabled() or not critical_findings:
+        return False
+
+    scan_signature = _critical_alert_signature(repo_id, critical_findings)
+    if _critical_alert_already_sent(client, repo_id, scan_signature):
+        return False
+
+    from_address = ALERT_EMAIL_FROM or SMTP_USER or "darkshield@localhost"
+    subject = f"[DarkShield] Critical findings in {owner}/{name}"
+
+    lines = [
+        f"Repository: {owner}/{name}",
+        f"URL: {repo_url}",
+        f"Critical findings: {len(critical_findings)}",
+        "",
+        "Top critical findings:",
+    ]
+
+    for finding in critical_findings[:10]:
+        lines.append(
+            f"- {finding['secret_type']} | {finding['file_path']}:{finding['line_number']} | {finding['snippet']}"
+        )
+
+    if len(critical_findings) > 10:
+        lines.append(f"- ... and {len(critical_findings) - 10} more")
+
+    if ai_reasoning:
+        lines.extend(["", "AI summary:", ai_reasoning])
+
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = from_address
+    message["To"] = ", ".join(ALERT_EMAIL_TO)
+    message.set_content("\n".join(lines))
+
+    try:
+        if SMTP_USE_SSL:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as smtp:
+                if SMTP_USER and SMTP_PASSWORD:
+                    smtp.login(SMTP_USER, SMTP_PASSWORD)
+                smtp.send_message(message)
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as smtp:
+                if SMTP_USE_TLS:
+                    smtp.starttls()
+                if SMTP_USER and SMTP_PASSWORD:
+                    smtp.login(SMTP_USER, SMTP_PASSWORD)
+                smtp.send_message(message)
+        _record_critical_alert(
+            client=client,
+            repo_id=repo_id,
+            scan_signature=scan_signature,
+            critical_count=len(critical_findings),
+            total_count=total_count,
+            recipients=ALERT_EMAIL_TO,
+            delivery_status="sent",
+        )
+        return True
+    except Exception as exc:
+        try:
+            _record_critical_alert(
+                client=client,
+                repo_id=repo_id,
+                scan_signature=scan_signature,
+                critical_count=len(critical_findings),
+                total_count=total_count,
+                recipients=ALERT_EMAIL_TO,
+                delivery_status="failed",
+                error_message=f"{type(exc).__name__}: {exc}",
+            )
+        except Exception:
+            pass
+        return False
 
 
 def _build_reasoning(owner: str, name: str, findings: list[dict[str, Any]]) -> str:
@@ -354,6 +504,17 @@ async def scan_repo(req: ScanRequest, request: Request) -> dict[str, Any]:
         findings_for_reasoning.append(finding)
 
     ai_reasoning = _build_reasoning(owner, name, findings_for_reasoning)
+    critical_findings = [finding for finding in unique_findings if str(finding.get("severity") or "").upper() == "CRITICAL"]
+    mail_sent = _send_critical_mail(
+        client,
+        req.repo_id,
+        owner,
+        name,
+        github_url,
+        critical_findings,
+        ai_reasoning,
+        len(unique_findings),
+    )
 
     client.table("repos").update(
         {
@@ -369,6 +530,9 @@ async def scan_repo(req: ScanRequest, request: Request) -> dict[str, Any]:
         "github_url": github_url,
         "total": len(unique_findings),
         "ai_reasoning": ai_reasoning,
+        "critical_alerts_enabled": _mail_alerts_enabled(),
+        "critical_alert_email_sent": mail_sent,
+        "critical_findings": len(critical_findings),
     }
 
 

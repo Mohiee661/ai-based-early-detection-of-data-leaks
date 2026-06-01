@@ -13,6 +13,7 @@ drop table if exists public.case_alerts cascade;
 drop table if exists public.case_findings cascade;
 drop table if exists public.cases cascade;
 drop table if exists public.alerts cascade;
+drop table if exists public.critical_alert_notifications cascade;
 drop table if exists public.findings cascade;
 drop table if exists public.clusters cascade;
 drop table if exists public.repos cascade;
@@ -137,6 +138,19 @@ create table public.alerts (
   updated_at          timestamptz not null default now()
 );
 
+create table public.critical_alert_notifications (
+  id              uuid primary key default gen_random_uuid(),
+  repo_id         uuid not null references public.repos(id) on delete cascade,
+  scan_signature  text not null,
+  critical_count  int not null default 0 check (critical_count >= 0),
+  total_count     int not null default 0 check (total_count >= 0),
+  recipients      text[] not null default '{}'::text[],
+  delivery_status text not null check (delivery_status in ('sent', 'failed', 'skipped')),
+  error_message   text,
+  created_at      timestamptz not null default now(),
+  unique (repo_id, scan_signature)
+);
+
 create table public.cases (
   id                text primary key,
   title             text not null,
@@ -215,6 +229,11 @@ create index if not exists idx_alerts_status on public.alerts (status);
 create index if not exists idx_alerts_created_at on public.alerts (created_at desc);
 create index if not exists idx_alerts_updated_at on public.alerts (updated_at desc);
 
+create index if not exists idx_critical_alert_notifications_repo_id on public.critical_alert_notifications (repo_id);
+create index if not exists idx_critical_alert_notifications_signature on public.critical_alert_notifications (scan_signature);
+create index if not exists idx_critical_alert_notifications_status on public.critical_alert_notifications (delivery_status);
+create index if not exists idx_critical_alert_notifications_created_at on public.critical_alert_notifications (created_at desc);
+
 create index if not exists idx_cases_status on public.cases (status);
 create index if not exists idx_cases_severity on public.cases (severity);
 create index if not exists idx_cases_updated_at on public.cases (updated_at desc);
@@ -254,6 +273,7 @@ execute function public.set_updated_at();
 alter table public.repos enable row level security;
 alter table public.clusters enable row level security;
 alter table public.findings enable row level security;
+alter table public.critical_alert_notifications enable row level security;
 
 -- repos
 drop policy if exists "Users see own repos" on public.repos;
@@ -291,6 +311,54 @@ create policy "Clusters readable by authenticated users"
 on public.clusters
 for select
 using (auth.role() = 'authenticated');
+
+-- critical alert notifications
+drop policy if exists "Critical alert notifications selectable by owner" on public.critical_alert_notifications;
+create policy "Critical alert notifications selectable by owner"
+on public.critical_alert_notifications
+for select
+using (
+  exists (
+    select 1
+    from public.repos r
+    where r.id = critical_alert_notifications.repo_id
+      and r.user_id = auth.uid()
+  )
+);
+
+drop policy if exists "Critical alert notifications insertable by owner" on public.critical_alert_notifications;
+create policy "Critical alert notifications insertable by owner"
+on public.critical_alert_notifications
+for insert
+with check (
+  exists (
+    select 1
+    from public.repos r
+    where r.id = critical_alert_notifications.repo_id
+      and r.user_id = auth.uid()
+  )
+);
+
+drop policy if exists "Critical alert notifications updatable by owner" on public.critical_alert_notifications;
+create policy "Critical alert notifications updatable by owner"
+on public.critical_alert_notifications
+for update
+using (
+  exists (
+    select 1
+    from public.repos r
+    where r.id = critical_alert_notifications.repo_id
+      and r.user_id = auth.uid()
+  )
+)
+with check (
+  exists (
+    select 1
+    from public.repos r
+    where r.id = critical_alert_notifications.repo_id
+      and r.user_id = auth.uid()
+  )
+);
 
 drop policy if exists "Clusters insertable by authenticated users" on public.clusters;
 create policy "Clusters insertable by authenticated users"
